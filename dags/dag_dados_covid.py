@@ -8,6 +8,7 @@ from airflow.providers.http.operators.http import SimpleHttpOperator
 from airflow.models import Variable
 from airflow.operators.python_operator import PythonOperator
 from airflow.contrib.hooks.wasb_hook import WasbHook
+from airflow.providers.databricks.operators.databricks import DatabricksSubmitRunOperator
 import json
 import pandas as pd
 
@@ -16,6 +17,26 @@ path = Variable.get("path_vaccinated")
 compression = Variable.get("compression_vaccinated")
 filename = Variable.get("filename_vaccinated")
 blob_name = Variable.get("storage_blob_name")
+
+cluster_id = Variable.get("cluster_id")
+
+datalake_url = Variable.get("datalake_url")
+
+full_datalake_url = "abfss://{storage}@{url}"
+
+partition = "{{ ds }}"
+
+notebook_task = {
+    "notebook_path": "/Shared/dbr_processando_dados_covid",
+    "base_parameters": {"datalake_url_raw": full_datalake_url.format(storage="raw", url=datalake_url),
+                        "datalake_url_bronze": full_datalake_url.format(storage="bronze", url=datalake_url),
+                        "datalake_url_silver": full_datalake_url.format(storage="silver", url=datalake_url),
+                        "datalake_url_gold": full_datalake_url.format(storage="gold", url=datalake_url),
+                        "extracted_at": partition,
+                        "covid_path": "vaccinated/extracted_at={}".format(partition)
+                        }
+}
+
 default_args = {
     'owner': 'SergioPassos',
     'depends_on_past': False,
@@ -41,10 +62,11 @@ def processing_vaccinated(ti, path, filename, compression):
 
 def local_to_adls(dir_target, ds, filepath):
     adls = WasbHook(wasb_conn_id='conn_data_lake_raw')
+    dnow = datetime.now().strftime('%Y-%m-%d')
     if glob.glob(filepath):
         for f in glob.glob(filepath):
             print("File to move {}".format(f))
-            blob_path = dir_target + ds + '/' + f.split('/')[-1]
+            blob_path = dir_target + '/extracted_at={}/'.format(dnow) + f.split('/')[-1]
             print(blob_path)
             adls.delete_file(container_name='raw', blob_name=blob_path, ignore_if_missing=True)
             adls.load_file(file_path=f, container_name='raw', blob_name=blob_path)
@@ -73,7 +95,7 @@ with DAG('dag_dados_covid',
         task_id='get_vaccinated',
         http_conn_id='datasus_api',
         endpoint='/_search',
-        data=json.dumps({"size": 100}),
+        data=json.dumps({"size": 10000}),
         method='POST',
         headers=api_credentials,
         response_filter=lambda response: json.loads(response.text),
@@ -96,7 +118,15 @@ with DAG('dag_dados_covid',
         task_id='remove_local_file',
         python_callable=remove_local_file,
         op_kwargs={
-            'filepath': '.	/data/sus/covid/vaccinated/*.parquet'
+            'filepath': './data/sus/covid/vaccinated/*.parquet'
         }
     )
-    api_availabe >> get_vaccinated >> processing_vaccinated >> upload_to_adls >> remove_local_file
+
+    transform_covid_data = DatabricksSubmitRunOperator(
+        task_id="transform_covid_data",
+        databricks_conn_id="databricks_conn",
+        existing_cluster_id=cluster_id,
+        notebook_task=notebook_task
+    )
+
+    api_availabe >> get_vaccinated >> processing_vaccinated >> upload_to_adls >> remove_local_file >> transform_covid_data
